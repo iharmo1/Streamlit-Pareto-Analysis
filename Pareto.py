@@ -28,6 +28,13 @@ st.sidebar.header("Ajouter / Supprimer / Importer")
 # ------------------------------------------------------------
 # 🔥 Importation de fichier
 # ------------------------------------------------------------
+@st.cache_data
+def load_data(file):
+    if file.name.endswith(".csv"):
+        return pd.read_csv(file)
+    else:
+        return pd.read_excel(file)
+
 uploaded_file = st.sidebar.file_uploader(
     "Importer un fichier (CSV ou Excel) avec Cause + Occurrence",
     type=["csv", "xlsx"]
@@ -35,10 +42,7 @@ uploaded_file = st.sidebar.file_uploader(
 
 if uploaded_file is not None:
     try:
-        if uploaded_file.name.endswith(".csv"):
-            df_import = pd.read_csv(uploaded_file)
-        else:
-            df_import = pd.read_excel(uploaded_file)
+        df_import = load_data(uploaded_file).copy()
 
         # Vérifier colonnes
         if not {"Cause", "Occurrence"}.issubset(df_import.columns):
@@ -87,7 +91,11 @@ if st.session_state.data.empty:
 
 # --- TRI DÉCROISSANT ---
 df = st.session_state.data.copy()
-df["Occurrence"] = df["Occurrence"].astype(float)
+df["Occurrence"] = pd.to_numeric(df["Occurrence"], errors="coerce")
+df = df.dropna(subset=["Occurrence"])
+if df.empty:
+    st.warning("Aucune occurrence valide trouvée.")
+    st.stop()
 df = df.sort_values(by="Occurrence", ascending=False).reset_index(drop=True)
 
 # --- Calcul Pareto ---
@@ -107,7 +115,7 @@ def fig_to_png_bytes(figure):
 # --- Calcul Top causes (cumul ≤ 80%) ---
 cum_pct = df["% Cum"]
 top_count = cum_pct[cum_pct <= 0.8].index.max() + 1
-if math.isnan(top_count) or top_count == 0:
+if pd.isna(top_count) or top_count == 0:
     top_count = 1
 
 # --- Graphe Pareto ---
@@ -174,6 +182,11 @@ def export_excel_openpyxl(df, img_bytes, title):
 
     for _, r in df.iterrows():
         ws.append([r["Cause"], float(r["Occurrence"]), float(r["%"]), float(r["% Cum"])])
+
+    # Formater les colonnes % et % Cum en vrai pourcentage Excel
+    for row in range(3, ws.max_row + 1):
+        ws[f"C{row}"].number_format = '0.00%'
+        ws[f"D{row}"].number_format = '0.00%'
 
     img_bytes.seek(0)
     img = XLImage(img_bytes)

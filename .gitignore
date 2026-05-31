@@ -31,3 +31,5 @@ venv/
 test_pareto_5gb.csv
 .vscode
 
+
+testsprite_tests\tmp\config.json
