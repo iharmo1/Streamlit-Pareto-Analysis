@@ -2,16 +2,14 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from io import BytesIO
-import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
-from docx import Document
-from docx.shared import Inches
-from openpyxl import Workbook
-from openpyxl.drawing.image import Image as XLImage
-from openpyxl.styles import PatternFill
-import math
 import os
-import matplotlib.ticker as mtick
+
+# --- Optimisations de performance Pandas (Copy-on-Write / Lazy Evaluation) ---
+# Active le mode zéro-copie paresseux de Pandas pour des performances et une mémoire optimales
+pd.options.mode.copy_on_write = True
+
+# Remarque : Matplotlib est importé de manière 100% paresseuse (Lazy Import)
+# plus bas, uniquement si des données sont présentes et prêtes à être tracées.
 
 st.set_page_config(page_title="Analyse Pareto", page_icon="📊", layout="wide")
 st.title("📊 Analyse Pareto – Causes du problème")
@@ -60,7 +58,7 @@ if uploaded_file is not None:
         st.sidebar.error(f"Erreur d’importation : {e}")
 
 # --- Ajouter une cause ---
-with st.sidebar.form("add_form"):
+with st.sidebar.form("add_form", clear_on_submit=True):
     cause_in = st.text_input("Nom de la cause")
     occ_in = st.number_input("Occurrence", min_value=0.0, step=0.1, format="%.2f")
     submit = st.form_submit_button("Ajouter")
@@ -70,19 +68,27 @@ if submit:
     if cause_clean == "":
         st.sidebar.warning("Nom de cause vide — saisie ignorée.")
     else:
-        existing = st.session_state.data["Cause"].str.lower().tolist()
+        existing = st.session_state.data["Cause"].astype(str).str.lower().tolist()
         if cause_clean.lower() in existing:
-            st.sidebar.warning("Cette cause existe déjà.")
+            st.sidebar.warning(f"La cause '{cause_clean}' existe déjà.")
         else:
-            st.session_state.data.loc[len(st.session_state.data)] = [cause_clean, float(occ_in)]
-            st.sidebar.success("Cause ajoutée !")
+            new_row = pd.DataFrame([{"Cause": cause_clean, "Occurrence": float(occ_in)}])
+            st.session_state.data = pd.concat([st.session_state.data, new_row], ignore_index=True)
+            st.sidebar.success(f"Cause '{cause_clean}' ajoutée avec succès !")
+            st.rerun()
 
 # --- Supprimer une cause ---
-unique_causes = st.session_state.data["Cause"].unique().tolist()
-delete_choice = st.sidebar.selectbox("Supprimer une cause", [""] + unique_causes)
-if st.sidebar.button("Supprimer") and delete_choice != "":
-    st.session_state.data = st.session_state.data[st.session_state.data["Cause"] != delete_choice]
-    st.sidebar.success(f"Cause '{delete_choice}' supprimée.")
+unique_causes = st.session_state.data["Cause"].dropna().unique().tolist()
+if unique_causes:
+    delete_choice = st.sidebar.selectbox("Supprimer une cause", [""] + unique_causes)
+    col_del1, col_del2 = st.sidebar.columns([1, 1])
+    if col_del1.button("Supprimer") and delete_choice != "":
+        st.session_state.data = st.session_state.data[st.session_state.data["Cause"] != delete_choice].reset_index(drop=True)
+        st.sidebar.success(f"Cause '{delete_choice}' supprimée.")
+        st.rerun()
+    if col_del2.button("Tout vider"):
+        st.session_state.data = pd.DataFrame(columns=["Cause", "Occurrence"])
+        st.rerun()
 
 # --- Si vide ---
 if st.session_state.data.empty:
@@ -118,10 +124,18 @@ top_count = cum_pct[cum_pct <= 0.8].index.max() + 1
 if pd.isna(top_count) or top_count == 0:
     top_count = 1
 
-# --- Graphe Pareto ---
+# --- Graphe Pareto (⚡ Lazy Import de Matplotlib à la demande) ---
 st.subheader("📉📈 Diagramme de Pareto")
 
-fig, ax1 = plt.subplots(figsize=(10, 5))
+# Matplotlib n'est importé que maintenant pour accélérer le chargement initial de l'application
+import matplotlib
+matplotlib.use("Agg")  # Backend non-interactif rapide adapté au web
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+import matplotlib.ticker as mtick
+
+fig_w = max(10, len(df) * 0.7)
+fig, ax1 = plt.subplots(figsize=(fig_w, 5))
 plt.title(graph_title)
 
 x = np.arange(len(df))
@@ -146,6 +160,7 @@ ax2.add_patch(rect)
 fig.tight_layout()
 st.pyplot(fig)
 png_full = fig_to_png_bytes(fig)
+plt.close(fig)  # Libération mémoire immédiate de la figure Matplotlib
 
 # --- TOP 20% (Top causes cumulant 80%) ---
 fig_top, ax1t = plt.subplots(figsize=(8, 4))
@@ -170,9 +185,14 @@ ax2t.add_patch(rect_top)
 
 fig_top.tight_layout()
 png_top = fig_to_png_bytes(fig_top)
+plt.close(fig_top)  # Libération mémoire immédiate
 
-# --- EXPORT EXCEL ---
-def export_excel_openpyxl(df, img_bytes, title):
+# --- EXPORT EXCEL (Lazy loading d'openpyxl uniquement à la demande) ---
+def export_excel_openpyxl(df, img_bytes, title, top_n):
+    from openpyxl import Workbook
+    from openpyxl.drawing.image import Image as XLImage
+    from openpyxl.styles import PatternFill
+
     wb = Workbook()
     ws = wb.active
     ws.title = "Pareto"
@@ -193,7 +213,7 @@ def export_excel_openpyxl(df, img_bytes, title):
     ws.add_image(img, "F3")
 
     fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-    for row in range(3, 3 + top_count):
+    for row in range(3, 3 + top_n):
         ws[f"A{row}"].fill = fill
         ws[f"B{row}"].fill = fill
 
@@ -202,7 +222,7 @@ def export_excel_openpyxl(df, img_bytes, title):
     out.seek(0)
     return out
 
-excel_bytes = export_excel_openpyxl(df, png_full, graph_title)
+excel_bytes = export_excel_openpyxl(df, png_full, graph_title, top_count)
 
 st.download_button(
     label="📥 Télécharger Excel",
@@ -211,8 +231,11 @@ st.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
-# --- EXPORT WORD ---
+# --- EXPORT WORD (Lazy loading de docx uniquement à la demande) ---
 def generate_word_report(df, png_top_bytes, top_count, title):
+    from docx import Document
+    from docx.shared import Inches
+
     tmp_top = "pareto_top_temp.png"
 
     with open(tmp_top, "wb") as f:
@@ -331,7 +354,9 @@ function Badge() {
             },
             onMouseEnter: () => setScale(1.1),
             onMouseLeave: () => setScale(1)
-        }, 
+        },
+        "📊 Analyse Pareto Interactive"
+    );
 }
 
 root.render(React.createElement(Badge));
